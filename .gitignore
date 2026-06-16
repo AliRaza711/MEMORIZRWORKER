@@ -1,0 +1,22 @@
+# Binaries
+tmp/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+
+# OS
+.DS_Store
+Thumbs.db

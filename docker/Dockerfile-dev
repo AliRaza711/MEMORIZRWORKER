@@ -1,0 +1,18 @@
+FROM golang:1.22-alpine
+
+RUN apk add --no-cache git
+
+# Install Air for live-reload during development
+RUN go install github.com/air-verse/air@latest
+
+WORKDIR /app
+
+COPY go.mod ./
+RUN go mod download 2>/dev/null || true
+
+COPY . .
+
+# Resolve all transitive dependencies and generate go.sum
+RUN go mod tidy
+
+CMD ["air", "-c", ".air.toml"]
