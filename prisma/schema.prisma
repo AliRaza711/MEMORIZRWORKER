@@ -1,0 +1,171 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum SubscriptionTier {
+  Free
+  Pro
+}
+
+enum ReminderFrequency {
+  Once
+  Daily
+  Weekly
+  Monthly
+  Yearly
+}
+
+// 1. UPDATED: Added Worker States (Processing, Failed)
+enum ReminderStatus {
+  Pending
+  Processing
+  Completed
+  Failed
+  Snoozed
+}
+
+enum ReminderCategory {
+  General
+  Medical
+  Travel
+  Bill
+  Chore
+}
+
+enum FamilyRole {
+  Admin
+  Member
+}
+
+enum AdminRole {
+  Super_Admin
+  Support_Agent
+}
+
+enum LogSource {
+  Worker
+  Throttling
+  Stripe_Webhook
+  Auth
+}
+
+enum LogSeverity {
+  Info
+  Warning
+  Critical
+}
+
+// 2. NEW: Channel enum for multi-channel routing
+enum NotificationChannel {
+  Email
+  SMS
+  WhatsApp
+}
+
+model User {
+  id                 String           @id @default(uuid())
+  email              String           @unique
+  phone_number       String?
+  subscription_tier  SubscriptionTier @default(Free)
+  
+  // 3. NEW: Worker Credit & Circuit Breaker Tracking
+  premium_credits    Int              @default(0)
+  is_account_blocked Boolean          @default(false)
+  
+  // ADD THIS LINE FOR GLOBAL TIMEZONES
+  timezone           String           @default("Asia/Karachi") // Defaulting to your local timezone, but frontend will override this
+  
+  reminders          Reminder[]       @relation("UserReminders")
+  assigned           Reminder[]       @relation("AssignedReminders")
+  created_spaces     FamilySpace[]
+  family_memberships FamilyMember[]
+  created_at         DateTime         @default(now())
+  updated_at         DateTime         @updatedAt
+
+  @@index([is_account_blocked])
+}
+model Reminder {
+  id              String            @id @default(uuid())
+  user_id         String
+  user            User              @relation("UserReminders", fields: [user_id], references: [id])
+  title           String
+  description     String?
+  target_datetime DateTime
+  frequency       ReminderFrequency @default(Once)
+  status          ReminderStatus    @default(Pending)
+  nagging_enabled Boolean           @default(false)
+  category        ReminderCategory  @default(General)
+  assigned_to     String?
+  assignee        User?             @relation("AssignedReminders", fields: [assigned_to], references: [id])
+  metadata        Json?             @db.JsonB
+  
+  // 4. NEW: Worker execution fields
+  channels        NotificationChannel[] // Allows multiple channels (e.g. [Email, SMS])
+  failure_reason  String?               // For Admin Panel debugging
+  retry_count     Int               @default(0)
+  
+  created_at      DateTime          @default(now())
+  updated_at      DateTime          @updatedAt
+
+  // 5. NEW: Composite Indexes for the Go Worker Loop
+  @@index([target_datetime, status])
+  @@index([updated_at, status]) // For the Stuck Job Sweeper
+}
+
+model FamilySpace {
+  space_id   String         @id @default(uuid())
+  creator_id String
+  creator    User           @relation(fields: [creator_id], references: [id])
+  members    FamilyMember[]
+  created_at DateTime       @default(now())
+}
+
+model FamilyMember {
+  space_id String
+  user_id  String
+  role     FamilyRole @default(Member)
+
+  space FamilySpace @relation(fields: [space_id], references: [space_id])
+  user  User        @relation(fields: [user_id], references: [id])
+
+  @@id([space_id, user_id])
+}
+
+model AdminUser {
+  id            String    @id @default(uuid())
+  email         String    @unique
+  password_hash String
+  role          AdminRole @default(Support_Agent)
+  mfa_secret    String?
+  created_at    DateTime  @default(now())
+}
+
+model SystemLog {
+  log_id    String      @id @default(uuid())
+  source    LogSource
+  severity  LogSeverity
+  message   String
+  timestamp DateTime    @default(now())
+}
+
+model ApiUsageStat {
+  api_name           String   @id
+  daily_call_count   Int      @default(0)
+  error_count        Int      @default(0)
+  average_latency_ms Float    @default(0.0)
+  updated_at         DateTime @updatedAt
+}
+
+model Promo_Codes {
+  code                String   @id
+  discount_percent    Float
+  expires_at          DateTime
+  max_redemptions     Int      @default(1)
+  current_redemptions Int      @default(0)
+  created_at          DateTime @default(now())
+}

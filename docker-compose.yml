@@ -1,42 +1,16 @@
+version: '3.8'
 services:
-  # ── PostgreSQL 15 ────────────────────────────────────────
-  postgres:
-    image: postgres:15-alpine
+  db:
+    image: postgres:15
+    restart: always
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: memorizr
     ports:
       - "5432:5432"
-    environment:
-      POSTGRES_USER: memorizr
-      POSTGRES_PASSWORD: memorizr_secret
-      POSTGRES_DB: memorizr
     volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql
-    networks:
-      - memorizr
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U memorizr -d memorizr"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
-  # ── Memorizr Background Worker ───────────────────────────
-  worker:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile-dev
-    depends_on:
-      postgres:
-        condition: service_healthy
-    env_file:
-      - .env.example
-    volumes:
-      - ./:/app
-    networks:
-      - memorizr
+      - postgres_data:/var/lib/postgresql/data
 
 volumes:
-  pgdata:
-
-networks:
-  memorizr:
-    driver: bridge
+  postgres_data:

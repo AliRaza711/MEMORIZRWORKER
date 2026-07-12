@@ -10,7 +10,6 @@ package notifier
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"math/rand"
 	"time"
 
@@ -77,22 +76,12 @@ func (s *whatsAppSender) Send(ctx context.Context, r *domain.Reminder) error {
 func simulateHTTPCall(ctx context.Context, channel string, r *domain.Reminder) error {
     latency := time.Duration(50+rand.Intn(250)) * time.Millisecond
 
-    slog.Info("notifier: dispatching",
-        "channel", channel,
-        "reminder_id", r.ID,
-        "latency_ms", latency.Milliseconds(),
-    )
-
     select {
     case <-time.After(latency):
         if rand.Float64() < 0.05 {
             // CHANGED %d to %s for string UUIDs
             return fmt.Errorf("%s provider returned HTTP 503 for reminder %s", channel, r.ID) 
         }
-        slog.Info("notifier: delivered",
-            "channel", channel,
-            "reminder_id", r.ID,
-        )
         return nil
     case <-ctx.Done():
         return fmt.Errorf("notification cancelled: %w", ctx.Err())

@@ -1,13 +1,6 @@
 // Package worker implements a high-performance, bounded-concurrency
 // background worker that polls PostgreSQL for due reminders and dispatches
 // them through the notifier layer.
-//
-// Design principles:
-//   - SELECT … FOR UPDATE SKIP LOCKED for safe multi-instance polling
-//   - sync.WaitGroup to settle each batch before polling again
-//   - Context-based 3-minute timeout to prevent goroutine leaks
-//   - Graceful shutdown: context cancellation drains the current batch
-//   - Stuck job recovery: periodic sweep resets abandoned "processing" rows
 package worker
 
 import (
@@ -15,6 +8,7 @@ import (
     "fmt"
     "log/slog"
     "os"
+    "runtime"
     "strconv"
     "sync"
     "time"
@@ -25,22 +19,17 @@ import (
     "github.com/memorizr-worker/internal/notifier"
 )
 
-// ─── Configuration ───────────────────────────────────────────────────────────
-
-// PoolConfig holds the tunable knobs for the worker pool.
 type PoolConfig struct {
-    PollInterval      time.Duration // How often to check for due reminders.
-    BatchSize         int           // Max reminders to claim per poll cycle.
-    ProcessTimeout    time.Duration // Per-batch context deadline (SLA ceiling).
-    StuckJobThreshold time.Duration // How long before a "processing" row is considered stuck.
+    PollInterval      time.Duration
+    BatchSize         int
+    ProcessTimeout    time.Duration
+    StuckJobThreshold time.Duration
 }
 
-// DefaultConfig returns sensible defaults, overridden by environment variables
-// when present.
 func DefaultConfig() PoolConfig {
     cfg := PoolConfig{
         PollInterval:      5 * time.Second,
-        BatchSize:         20,
+        BatchSize:         100,
         ProcessTimeout:    3 * time.Minute,
         StuckJobThreshold: 5 * time.Minute,
     }
@@ -69,28 +58,31 @@ func DefaultConfig() PoolConfig {
     return cfg
 }
 
-// ─── Worker Pool ─────────────────────────────────────────────────────────────
-
-// Pool is the main coordinator. It owns the poll loop, spawns bounded
-// goroutines per batch, and handles lifecycle signals.
 type Pool struct {
     db       *pgxpool.Pool
     notifier *notifier.Client
     cfg      PoolConfig
+    
+    // FILE WRITING LOGIC FOR LOCAL BENCHMARK
+    outFile   *os.File
+    fileMutex sync.Mutex
 }
 
-// NewPool creates a worker pool wired to the given database and notifier.
 func NewPool(db *pgxpool.Pool, n *notifier.Client, cfg PoolConfig) *Pool {
+    // Open or create the text file to log finished reminders
+    f, err := os.OpenFile("reminders_done.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+    if err != nil {
+        panic("failed to open output file for reminders: " + err.Error())
+    }
+
     return &Pool{
-        db:       db,
+        db:      db,
         notifier: n,
-        cfg:      cfg,
+        cfg:     cfg,
+        outFile: f,
     }
 }
 
-// Run starts the main poll loop. It blocks until ctx is cancelled.
-// On cancellation it finishes processing the current in-flight batch
-// before returning.
 func (p *Pool) Run(ctx context.Context) {
     slog.Info("worker pool starting",
         "poll_interval", p.cfg.PollInterval,
@@ -98,71 +90,97 @@ func (p *Pool) Run(ctx context.Context) {
         "process_timeout", p.cfg.ProcessTimeout,
     )
 
-    ticker := time.NewTicker(p.cfg.PollInterval)
-    defer ticker.Stop()
-
-    // Run stuck-job recovery on a slower cadence (2× the threshold).
     stuckTicker := time.NewTicker(p.cfg.StuckJobThreshold * 2)
     defer stuckTicker.Stop()
 
     for {
-        select {
-        case <-ctx.Done():
+        // Check for shutdown signals
+        if ctx.Err() != nil {
             slog.Info("worker pool received shutdown signal")
             return
+        }
 
+        select {
         case <-stuckTicker.C:
             p.recoverStuckJobs(ctx)
+        default:
+            // Non-blocking default case allows the loop to run immediately
+        }
 
-        case <-ticker.C:
-            p.pollAndProcess(ctx)
+        // Process a batch and find out how many were processed
+        processedCount := p.pollAndProcess(ctx)
+
+        // SMART POLLING:
+        // If we processed LESS than a full batch, the queue is empty. We sleep.
+        // If we processed a FULL batch, we skip the sleep and fetch the next batch instantly.
+        if processedCount < p.cfg.BatchSize {
+            select {
+            case <-ctx.Done():
+                slog.Info("worker pool received shutdown signal")
+                return
+            case <-time.After(p.cfg.PollInterval):
+                // Woke up after sleeping, loop will restart
+            }
         }
     }
 }
 
-// ─── Poll Cycle ──────────────────────────────────────────────────────────────
-
-// pollAndProcess fetches a batch of due reminders, spawns a goroutine for
-// each, and blocks until the entire batch settles via sync.WaitGroup.
-func (p *Pool) pollAndProcess(ctx context.Context) {
-    // Create a child context with a strict timeout so no goroutine
-    // in this batch can run longer than ProcessTimeout.
+func (p *Pool) pollAndProcess(ctx context.Context) int {
     batchCtx, cancel := context.WithTimeout(ctx, p.cfg.ProcessTimeout)
     defer cancel()
 
+    // 1. TIMING: Searching / DB Fetch Time
+    fetchStart := time.Now()
     reminders, err := p.fetchBatch(batchCtx)
+    fetchDuration := time.Since(fetchStart)
+
     if err != nil {
         slog.Error("failed to fetch batch", "error", err)
-        return
+        return 0
     }
     if len(reminders) == 0 {
-        return
+        return 0
     }
 
-    slog.Info("processing batch", "count", len(reminders))
+    slog.Info("--------------------------------------------------")
+    slog.Info("📦 NEW BATCH STARTED",
+        "count", len(reminders),
+        "db_search_duration", fetchDuration,
+    )
 
+    batchStart := time.Now()
     var wg sync.WaitGroup
     wg.Add(len(reminders))
 
     for i := range reminders {
         r := reminders[i] // capture for goroutine
-        go func() {
+        go func(rem domain.Reminder) {
             defer wg.Done()
-            p.processReminder(batchCtx, &r)
-        }()
+            p.processReminder(batchCtx, &rem)
+        }(r)
     }
 
-    // Block until every goroutine in this batch has finished.
-    // This ensures we don't overlap batches and provides backpressure
-    // when downstream systems are slow.
     wg.Wait()
+
+    batchDuration := time.Since(batchStart)
+
+    // MEMORY AND THREAD PROFILING
+    var m runtime.MemStats
+    runtime.ReadMemStats(&m)
+    activeGoroutines := runtime.NumGoroutine()
+
+    slog.Info("✅ BATCH COMPLETELY PROCESSED",
+        "count", len(reminders),
+        "total_batch_duration", batchDuration,
+        "active_threads_goroutines", activeGoroutines,
+        "memory_alloc_mb", float64(m.Alloc)/1024/1024,
+        "memory_sys_mb", float64(m.Sys)/1024/1024,
+    )
+    slog.Info("--------------------------------------------------")
+
+    return len(reminders)
 }
 
-// ─── Database Operations ─────────────────────────────────────────────────────
-
-// fetchBatch claims up to BatchSize pending reminders using
-// SELECT … FOR UPDATE SKIP LOCKED. This is safe for concurrent workers:
-// each instance sees only unclaimed rows.
 func (p *Pool) fetchBatch(ctx context.Context) ([]domain.Reminder, error) {
     query := `
         UPDATE "Reminder"
@@ -191,8 +209,6 @@ func (p *Pool) fetchBatch(ctx context.Context) ([]domain.Reminder, error) {
     var batch []domain.Reminder
     for rows.Next() {
         var r domain.Reminder
-        // Note: Make sure your internal/domain/reminder.go struct 
-        // matches these exported fields (ID, UserID, Title, etc.)
         if err := rows.Scan(
             &r.ID, &r.UserID, &r.Title, &r.Description, &r.TargetDatetime,
             &r.Status, &r.RetryCount, &r.FailureReason,
@@ -200,17 +216,13 @@ func (p *Pool) fetchBatch(ctx context.Context) ([]domain.Reminder, error) {
         ); err != nil {
             return nil, fmt.Errorf("scanning reminder row: %w", err)
         }
-        
-        // ADD THIS LINE to default the routing to WhatsApp
-        r.Channel = domain.ChannelWhatsApp 
-        
+        r.Channel = domain.ChannelWhatsApp
         batch = append(batch, r)
     }
 
     return batch, rows.Err()
 }
 
-// markSent transitions a reminder to "Completed" after successful delivery.
 func (p *Pool) markSent(ctx context.Context, id string) error {
     _, err := p.db.Exec(ctx,
         `UPDATE "Reminder" SET status = 'Completed' WHERE id = $1`, id,
@@ -218,8 +230,6 @@ func (p *Pool) markSent(ctx context.Context, id string) error {
     return err
 }
 
-// markFailed records the error message and either requeues the reminder
-// as "Pending" (if retries remain) or moves it to "Failed".
 func (p *Pool) markFailed(ctx context.Context, r *domain.Reminder, sendErr error) error {
     errMsg := sendErr.Error()
     newStatus := domain.StatusPending // requeue for retry
@@ -234,52 +244,58 @@ func (p *Pool) markFailed(ctx context.Context, r *domain.Reminder, sendErr error
     return err
 }
 
-// ─── Per-Reminder Processing ─────────────────────────────────────────────────
-
-// processReminder dispatches a single reminder through the notifier and
-// updates its database status based on the outcome.
 func (p *Pool) processReminder(ctx context.Context, r *domain.Reminder) {
-    credit := r.Credit()
-    slog.Info("processing reminder",
-        "id", r.ID,
-        "attempt", r.RetryCount,
-        "credits_remaining", credit.Remaining,
-    )
+    processStart := time.Now()
 
-    err := p.notifier.Dispatch(ctx, r)
+    // 2. TIMING: File Write Time (Simulating WhatsApp Dispatch latency)
+    dispatchStart := time.Now()
+    
+    // Artificial 20ms network simulation latency 
+    time.Sleep(20 * time.Millisecond)
+    
+    // Mutex Lock to prevent multi-threaded file write race conditions
+    p.fileMutex.Lock()
+    _, writeErr := p.outFile.WriteString(fmt.Sprintf("Reminder %s done!\n", r.ID))
+    p.fileMutex.Unlock()
+    
+    dispatchDuration := time.Since(dispatchStart)
 
-    if err != nil {
-        slog.Warn("delivery failed",
+    if writeErr != nil {
+        updateStart := time.Now()
+        dbErr := p.markFailed(ctx, r, writeErr)
+        updateDuration := time.Since(updateStart)
+
+        slog.Warn("delivery failed (file write)",
             "id", r.ID,
-            "error", err,
-            "will_retry", r.CanRetry(),
+            "error", writeErr,
+            "dispatch_duration", dispatchDuration,
+            "db_update_duration", updateDuration,
         )
-        if dbErr := p.markFailed(ctx, r, err); dbErr != nil {
-            slog.Error("failed to mark reminder as failed",
-                "id", r.ID,
-                "db_error", dbErr,
-            )
+        if dbErr != nil {
+            slog.Error("failed to mark reminder as failed", "id", r.ID, "db_error", dbErr)
         }
         return
     }
 
-    if dbErr := p.markSent(ctx, r.ID); dbErr != nil {
-        slog.Error("failed to mark reminder as sent",
-            "id", r.ID,
-            "db_error", dbErr,
-        )
+    // 3. TIMING: DB Update Time (PostgreSQL)
+    updateStart := time.Now()
+    dbErr := p.markSent(ctx, r.ID)
+    updateDuration := time.Since(updateStart)
+
+    if dbErr != nil {
+        slog.Error("failed to mark reminder as sent", "id", r.ID, "db_error", dbErr)
         return
     }
 
-    slog.Info("reminder delivered",
+    // Final Micro-Timing Log per reminder
+    slog.Info("🚀 reminder delivered",
         "id", r.ID,
+        "dispatch_duration", dispatchDuration,
+        "db_update_duration", updateDuration,
+        "total_item_duration", time.Since(processStart),
     )
 }
 
-// ─── Stuck Job Recovery ──────────────────────────────────────────────────────
-
-// recoverStuckJobs resets reminders that have been in "Processing" state
-// longer than StuckJobThreshold back to "Pending" so they can be retried.
 func (p *Pool) recoverStuckJobs(ctx context.Context) {
     query := `
         UPDATE "Reminder"
@@ -302,20 +318,13 @@ func (p *Pool) recoverStuckJobs(ctx context.Context) {
     }
 }
 
-// ─── Healthcheck ─────────────────────────────────────────────────────────────
-
-// Healthy reports whether the worker pool can reach the database.
 func (p *Pool) Healthy(ctx context.Context) error {
     ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
     defer cancel()
-
     var n int
     return p.db.QueryRow(ctx, "SELECT 1").Scan(&n)
 }
 
-// ─── Stats ───────────────────────────────────────────────────────────────────
-
-// Stats holds a point-in-time snapshot of queue depths, useful for dashboards.
 type Stats struct {
     Pending    int64 `json:"pending"`
     Processing int64 `json:"processing"`
@@ -323,7 +332,6 @@ type Stats struct {
     Failed     int64 `json:"failed"`
 }
 
-// GetStats queries the current distribution of reminder statuses.
 func (p *Pool) GetStats(ctx context.Context) (*Stats, error) {
     query := `
         SELECT
@@ -342,7 +350,6 @@ func (p *Pool) GetStats(ctx context.Context) (*Stats, error) {
     return &s, nil
 }
 
-// ensure Pool implements a compile-time interface check if needed
 var _ interface {
     Run(ctx context.Context)
     Healthy(ctx context.Context) error
